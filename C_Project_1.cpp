@@ -4,7 +4,9 @@
 #include "framework.h"
 #include "C_Project_1.h"
 #include <math.h>
-
+#include <fstream>
+#include <vector>
+#include <algorithm>
 #define MAX_LOADSTRING 100
 #define TIMER_ID 1 //定时器ID
 #define PLAYER_RADIUS 15 // 玩家角色半径
@@ -20,10 +22,14 @@
 #define ENEMY_BULLET_SPEED 8
 #define MAX_ENEMY_BULLETS 64
 
+const char* HIGH_SCORE_FILE = "highscore.dat";
+
 // 全局变量:
 HINSTANCE hInst;                                // 当前实例
 WCHAR szTitle[MAX_LOADSTRING];                  // 标题栏文本
 WCHAR szWindowClass[MAX_LOADSTRING];            // 主窗口类名
+int highScore = 0;                              // 最高分
+
 // 玩家角色结构
 struct Player {
     int x, y;
@@ -37,11 +43,21 @@ struct Obstacle {
     bool active;
 } obstacles[MAX_OBSTACLE_COUNT];
 
+// 保护盾相关
+bool protectionOn = false;
+int protectionFrame = 0;
+
+// 多子弹相关
+#define MAX_PLAYER_BULLETS 3
 struct Bullet {
     int x, y;
-    float dx, dy; // 单位方向向量
+    float dx, dy;
     bool active;
-} bullet = {0, 0, 0, 0, false};
+};
+Bullet playerBullets[MAX_PLAYER_BULLETS] = {};
+
+// 障碍物被击中计数
+int obstacleHitCount[MAX_OBSTACLE_COUNT] = {};
 
 struct EnemyBullet {
     int x, y;
@@ -67,6 +83,9 @@ void                InitGame();
 void                UpdateGame();
 bool                CheckCollision(Obstacle& obs);
 void                DrawGame(HDC hdc, int clientWidth, int clientHeight);
+void                LoadHighScore();
+void                SaveHighScore();
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
@@ -90,6 +109,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     MSG msg;
 
+    // 加载最高分
+    LoadHighScore();
+
     // 主消息循环:
     while (GetMessage(&msg, nullptr, 0, 0))
     {
@@ -99,6 +121,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
             DispatchMessage(&msg);
         }
     }
+
+    // 保存最高分
+    SaveHighScore();
 
     return (int) msg.wParam;
 }
@@ -153,6 +178,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
       return FALSE;
    }
    // 初始化游戏
+   LoadHighScore(); // 加载最高分
    InitGame();
 
    // 设置定时器
@@ -183,6 +209,10 @@ void InitGame() {
     }
     gameOver = false;
     score = 0;
+    protectionOn = false;
+    protectionFrame = 0;
+    for (int i = 0; i < MAX_PLAYER_BULLETS; ++i) playerBullets[i].active = false;
+    for (int i = 0; i < MAX_OBSTACLE_COUNT; ++i) obstacleHitCount[i] = 0;
 }
 
 //
@@ -269,37 +299,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 player.y += speed;
                 break;
             case VK_SPACE:
-                if (!bullet.active) {
-                    // 找到最近的障碍物
-                    int minDist = INT_MAX, target = -1;
-                    for (int i = 0; i < obstacleCount; ++i) {
-                        if (!obstacles[i].active) continue;
-                        int ox = obstacles[i].x + obstacles[i].width / 2;
-                        int oy = obstacles[i].y + obstacles[i].height / 2;
-                        int dx = ox - player.x;
-                        int dy = oy - player.y;
-                        int dist = dx * dx + dy * dy;
-                        if (dist < minDist) {
-                            minDist = dist;
-                            target = i;
-                        }
-                    }
-                    if (target != -1) {
-                        int ox = obstacles[target].x + obstacles[target].width / 2;
-                        int oy = obstacles[target].y + obstacles[target].height / 2;
-                        float vx = ox - player.x;
-                        float vy = oy - player.y;
-                        float len = sqrtf(vx * vx + vy * vy);
-                        if (len > 0.1f) {
-                            bullet.x = player.x;
-                            bullet.y = player.y;
-                            bullet.dx = vx / len;
-                            bullet.dy = vy / len;
-                            bullet.active = true;
+            {
+				if (score >= 10000) break; // 分数超过10000时不允许发射
+                // 统计可用子弹槽
+                int available = 0;
+                for (int i = 0; i < MAX_PLAYER_BULLETS; ++i)
+                    if (!playerBullets[i].active) available++;
+                if (available == 0) break;
+
+                // 收集最近的障碍物
+                struct TargetInfo { int idx; int dist; };
+                std::vector<TargetInfo> targets;
+                for (int i = 0; i < obstacleCount; ++i) {
+                    if (!obstacles[i].active) continue;
+                    int ox = obstacles[i].x + obstacles[i].width / 2;
+                    int oy = obstacles[i].y + obstacles[i].height / 2;
+                    int dx = ox - player.x;
+                    int dy = oy - player.y;
+                    int dist = dx * dx + dy * dy;
+                    targets.push_back({ i, dist });
+                }
+                std::sort(targets.begin(), targets.end(), [](const TargetInfo& a, const TargetInfo& b) { return a.dist < b.dist; });
+
+                int bulletCount = (score >= 5000) ? 3 : 1;
+                int fired = 0;
+                for (int t = 0; t < (int)targets.size() && fired < bulletCount; ++t) {
+                    int i = targets[t].idx;
+                    int ox = obstacles[i].x + obstacles[i].width / 2;
+                    int oy = obstacles[i].y + obstacles[i].height / 2;
+                    float vx = ox - player.x;
+                    float vy = oy - player.y;
+                    float len = sqrtf(vx * vx + vy * vy);
+                    if (len > 0.1f) {
+                        // 找到空闲子弹槽
+                        for (int b = 0; b < MAX_PLAYER_BULLETS; ++b) {
+                            if (!playerBullets[b].active) {
+                                playerBullets[b].x = player.x;
+                                playerBullets[b].y = player.y;
+                                playerBullets[b].dx = vx / len;
+                                playerBullets[b].dy = vy / len;
+                                playerBullets[b].active = true;
+                                fired++;
+                                break;
+                            }
                         }
                     }
                 }
                 break;
+            }
             }
             // 确保玩家角色不出界
             if (player.x < PLAYER_RADIUS) player.x = PLAYER_RADIUS;
@@ -320,6 +367,7 @@ void UpdateGame() {
     GetClientRect(GetActiveWindow(), &rect);
     int clientWidth = rect.right - rect.left;
     int clientHeight = rect.bottom - rect.top;
+    int specialEnemyBulletCounter = 0;
 
     // --- 新增逻辑：障碍物数量小于2时补充到10个 ---
     int activeCount = 0;
@@ -394,21 +442,67 @@ void UpdateGame() {
             }
             // 检查碰撞
             if (CheckCollision(obstacles[i])) {
-                gameOver = true; 
-                return; // 游戏结束
+                if (!protectionOn) {
+                    gameOver = true;
+                    return; // 游戏结束
+                }
+                // 有护盾时不Game Over，直接跳过
             }
         }
     }
 
-    // 更新子弹
-    if (bullet.active) {
-        bullet.x += int(bullet.dx * BULLET_SPEED);
-        bullet.y += int(bullet.dy * BULLET_SPEED);
+    
 
-        // 检查是否出界
-        if (bullet.x < 0 || bullet.x > clientWidth ||
-            bullet.y < 0 || bullet.y > clientHeight) {
-            bullet.active = false;
+    // 玩家子弹移动
+    int bulletSpeed = (score >= 5000) ? (BULLET_SPEED * 2) : BULLET_SPEED;
+    for (int b = 0; b < MAX_PLAYER_BULLETS; ++b) {
+        if (!playerBullets[b].active) continue;
+        playerBullets[b].x += int(playerBullets[b].dx * bulletSpeed);
+        playerBullets[b].y += int(playerBullets[b].dy * bulletSpeed);
+        // 出界
+        if (playerBullets[b].x < 0 || playerBullets[b].x > clientWidth ||
+            playerBullets[b].y < 0 || playerBullets[b].y > clientHeight) {
+            playerBullets[b].active = false;
+            continue;
+        }
+        // 检查与障碍物碰撞
+        for (int i = 0; i < obstacleCount; ++i) {
+            if (!obstacles[i].active) continue;
+            int ox = obstacles[i].x + obstacles[i].width / 2;
+            int oy = obstacles[i].y + obstacles[i].height / 2;
+            int dx = playerBullets[b].x - ox;
+            int dy = playerBullets[b].y - oy;
+            int rx = obstacles[i].width / 2 + BULLET_RADIUS;
+            int ry = obstacles[i].height / 2 + BULLET_RADIUS;
+            if (abs(dx) <= rx && abs(dy) <= ry) {
+                // 命中
+                obstacleHitCount[i]++;
+                playerBullets[b].active = false;
+                if (obstacleHitCount[i] >= 2) {
+                    obstacles[i].active = false;
+                    obstacleHitCount[i] = 0;
+                }
+                break;
+            }
+        }
+    }
+
+    // 玩家子弹移动后，障碍物被击中处理后添加
+    int aliveObs = 0;
+    for (int i = 0; i < obstacleCount; ++i) {
+        if (obstacles[i].active) aliveObs++;
+    }
+    if (aliveObs == 0) {
+        obstacleCount = MAX_OBSTACLE_COUNT;
+        for (int i = 0; i < MAX_OBSTACLE_COUNT; ++i) {
+            obstacles[i].x = rand() % 700 + 50;
+            obstacles[i].y = rand() % 500 + 50;
+            obstacles[i].width = OBSTACLE_WIDTH;
+            obstacles[i].height = OBSTACLE_HEIGHT;
+            obstacles[i].speedX = (rand() % 2 == 0 ? -1 : 1) * (rand() % 3 + 1);
+            obstacles[i].speedY = (rand() % 2 == 0 ? -1 : 1) * (rand() % 3 + 1);
+            obstacles[i].active = true;
+            obstacleHitCount[i] = 0;
         }
     }
 
@@ -458,28 +552,76 @@ void UpdateGame() {
         int distY = abs(enemyBullets[i].y - player.y);
         if (distX * distX + distY * distY <= PLAYER_RADIUS * PLAYER_RADIUS) {
             enemyBullets[i].active = false;
-            playerHitCount++;
-            if (playerHitCount >= 20) { // 修改为10次才Game Over
-                gameOver = true;
-                return;
+            if (!protectionOn) {
+                playerHitCount++;
+                if (playerHitCount >= 20) {
+                    gameOver = true;
+                    return;
+                }
             }
             continue;
         }
 
-        // 击中玩家子弹
-        if (bullet.active) {
-            int dx = enemyBullets[i].x - bullet.x;
-            int dy = enemyBullets[i].y - bullet.y;
-            if (dx * dx + dy * dy <= (BULLET_RADIUS + ENEMY_BULLET_RADIUS) * (BULLET_RADIUS + ENEMY_BULLET_RADIUS)) {
-                enemyBullets[i].active = false;
-                bullet.active = false;
-                continue;
-            }
-        }
+       
+        
     }
 
     // 增加分数
     score++;
+    if (score > highScore) {
+        highScore = score; // 更新最高分
+        SaveHighScore();
+    }
+
+    // 在score++后添加
+    static int lastProtectionScore = 0;
+    if (score / 500 > lastProtectionScore / 500) {
+        protectionOn = true;
+        protectionFrame = 200;
+    }
+    lastProtectionScore = score;
+
+    // 保护盾帧数递减
+    if (protectionOn) {
+        protectionFrame--;
+        if (protectionFrame <= 0) {
+            protectionOn = false;
+            protectionFrame = 0;
+        }
+    }
+    // 15000分后每400帧有4个障碍物向玩家发射子弹
+    if (score >= 15000) {
+        specialEnemyBulletCounter++;
+        if (specialEnemyBulletCounter >= 400) {
+            specialEnemyBulletCounter = 0;
+            int firedCount = 0;
+            for (int i = 0; i < obstacleCount; ++i) {
+                if (!obstacles[i].active) continue;
+                if (firedCount >= 4) break;
+                // 找到空闲子弹槽
+                for (int j = 0; j < MAX_ENEMY_BULLETS; ++j) {
+                    if (!enemyBullets[j].active) {
+                        enemyBullets[j].x = obstacles[i].x + obstacles[i].width / 2;
+                        enemyBullets[j].y = obstacles[i].y + obstacles[i].height / 2;
+                        float vx = player.x - enemyBullets[j].x;
+                        float vy = player.y - enemyBullets[j].y;
+                        float len = sqrtf(vx * vx + vy * vy);
+                        if (len > 0.1f) {
+                            enemyBullets[j].dx = vx / len;
+                            enemyBullets[j].dy = vy / len;
+                            enemyBullets[j].active = true;
+                        }
+                        break;
+                    }
+                }
+                firedCount++;
+            }
+        }
+    }
+    else {
+        specialEnemyBulletCounter = 0; // 分数不到15000时计数器归零
+    }
+
 }
 // 检测玩家与障碍物的碰撞
 bool CheckCollision(Obstacle& obs) {
@@ -539,8 +681,8 @@ void DrawGame(HDC hdc, int clientWidth, int clientHeight) {
     SetTextColor(hdc, RGB(0, 0, 0));
     SetBkMode(hdc, TRANSPARENT);
 
-    wchar_t scoreText[50];
-    swprintf_s(scoreText, L"Score: %d", score);
+    wchar_t scoreText[100];
+    swprintf_s(scoreText, L"Score: %d    Highest Score: %d", score, highScore);
     DrawText(hdc, scoreText, -1, &rect, DT_TOP | DT_LEFT);
 
     SelectObject(hdc, oldFont);
@@ -561,12 +703,29 @@ void DrawGame(HDC hdc, int clientWidth, int clientHeight) {
         }
     }
     DeleteObject(obstacleBrush);
-    // 在DrawGame函数最后添加，绘制红色点点（子弹）
-    if (bullet.active) {
-        HBRUSH bulletBrush = CreateSolidBrush(RGB(255, 0, 0));
-        Ellipse(hdc, bullet.x - BULLET_RADIUS, bullet.y - BULLET_RADIUS,
-                bullet.x + BULLET_RADIUS, bullet.y + BULLET_RADIUS);
-        DeleteObject(bulletBrush);
+    
+    // 绘制所有玩家子弹
+    for (int b = 0; b < MAX_PLAYER_BULLETS; ++b) {
+        if (playerBullets[b].active) {
+            Ellipse(hdc, playerBullets[b].x - BULLET_RADIUS, playerBullets[b].y - BULLET_RADIUS,
+                    playerBullets[b].x + BULLET_RADIUS, playerBullets[b].y + BULLET_RADIUS);
+        }
+    }
+    // 绘制保护盾
+    if (protectionOn) {
+        HPEN hPen = CreatePen(PS_DASH, 2, RGB(0, 128, 255));
+        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+        int r = PLAYER_RADIUS + 8;
+        Arc(hdc, player.x - r, player.y - r, player.x + r, player.y + r, player.x, player.y - r, player.x, player.y + r);
+        SelectObject(hdc, hOldPen);
+        DeleteObject(hPen);
+    }
+    // 计分板旁显示“Protection On”
+    if (protectionOn) {
+        RECT protRect = rect;
+        protRect.left += 260;
+        SetTextColor(hdc, RGB(0, 128, 255));
+        DrawText(hdc, L"Protection On", -1, &protRect, DT_TOP | DT_LEFT);
     }
     // 在DrawGame函数最后添加
     for (int i = 0; i < MAX_ENEMY_BULLETS; ++i) {
@@ -596,4 +755,20 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
         break;
     }
     return (INT_PTR)FALSE;
+}
+
+void LoadHighScore() {
+    std::ifstream fin(HIGH_SCORE_FILE, std::ios::binary);
+    if (fin) {
+        fin.read(reinterpret_cast<char*>(&highScore), sizeof(highScore));
+        fin.close();
+    }
+}
+
+void SaveHighScore() {
+    std::ofstream fout(HIGH_SCORE_FILE, std::ios::binary);
+    if (fout) {
+        fout.write(reinterpret_cast<const char*>(&highScore), sizeof(highScore));
+        fout.close();
+    }
 }
